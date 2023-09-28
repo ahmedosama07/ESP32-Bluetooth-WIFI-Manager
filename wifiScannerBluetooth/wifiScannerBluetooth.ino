@@ -1,210 +1,209 @@
+#include <WiFi.h>
+#include <Preferences.h>
 #include "BluetoothSerial.h"
-#include "wifiScanner.h"
-#include <FS.h>
-#include <LittleFS.h>
-#include <ArduinoJson.h>
 
-#define FORMAT_LITTLEFS_IF_FAILED true
-DynamicJsonDocument Config(2048);
-JsonObject obj = Config.as<JsonObject>();
+#define FORMAT 23
 
-int n = 0;
-String ssid = "";
-String pass = "";
-unsigned long timestart = 0;
-unsigned long timeout = 0;
-int trial = 0;
-static int no_ssid = 0;
-int u = 0;
-String credentials_array[2];
 
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run make menuconfig to and enable it
-#endif
+String ssids_array[50];
+String network_string;
+String connected_string;
+
+const char* pref_ssid = "";
+const char* pref_pass = "";
+String client_wifi_ssid;
+String client_wifi_password;
+
+const char* bluetooth_name = "ESP33";
+
+long start_wifi_millis;
+long wifi_timeout = 10000;
+bool bluetooth_disconnect = false;
+
+enum wifi_setup_stages { NONE, SCAN_START, SCAN_COMPLETE, SSID_ENTERED, WAIT_PASS, PASS_ENTERED, WAIT_CONNECT, LOGIN_FAILED };
+enum wifi_setup_stages wifi_stage = NONE;
 
 BluetoothSerial SerialBT;
+Preferences preferences;
 
-void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
-  if (event == ESP_SPP_SRV_OPEN_EVT) {
-    Serial.println("Client Connected");
-    u = 1;
-  }
 
-  if (event == ESP_SPP_CLOSE_EVT) {
-    Serial.println("Client disconnected");
-  }
-}
-
-void createDir(fs::FS &fs, const char *path) {
-  Serial.printf("Creating Dir: %s\n", path);
-  if (fs.mkdir(path)) {
-    Serial.println("Dir created");
-  } else {
-    Serial.println("mkdir failed");
-  }
-}
-
-void readFile(fs::FS &fs, const char *path) {
-  Serial.printf("Reading file: %s\r\n", path);
-  String credentials = "";
-
-  File file = fs.open(path);
-  if (!file || file.isDirectory()) {
-    Serial.println("- failed to open file for reading");
-    return;
-  }
-
-  Serial.println("- read from file:");
-  while (file.available()) {
-    credentials += file.readString();
-  }
-  deserializeJson(Config, credentials);
-  file.close();
-  credentials_array[0] = Config["ssid"];
-  credentials_array[1] = Config["pass"];
-  return;
-}
-
-void writeFile(fs::FS &fs, const char *path, const char *message) {
-  Serial.printf("Writing file: %s\r\n", path);
-
-  File file = fs.open(path, FILE_WRITE);
-  if (!file) {
-    Serial.println("- failed to open file for writing");
-    return;
-  }
-  if (file.print(message)) {
-    Serial.println("- file written");
-  } else {
-    Serial.println("- write failed");
-  }
-  file.close();
-}
-
-void appendFile(fs::FS &fs, const char *path, const char *message) {
-  Serial.printf("Appending to file: %s\r\n", path);
-
-  File file = fs.open(path, FILE_APPEND);
-  if (!file) {
-    Serial.println("- failed to open file for appending");
-    return;
-  }
-  if (file.print(message)) {
-    Serial.println("- message appended");
-  } else {
-    Serial.println("- append failed");
-  }
-  file.close();
-}
-
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  SerialBT.begin("Yalla");  //Bluetooth device name
-  Serial.println("The device started, now you can pair it with bluetooth!");
-  readFile(LittleFS, "/mydir/wifi.json");
-  if (credentials_array[0] == "") {
-    while (u == 0) { SerialBT.register_callback(callback); }
-    wifiScan();
-    wifiInit(timeout, trial);
+  pinMode(FORMAT, INPUT_PULLUP);
+  Serial.println("Booting...");
+
+  preferences.begin("wifi_access", false);
+
+  if (!init_wifi()) { // Connect to Wi-Fi fails
+    SerialBT.register_callback(callback);
+  } else {
+    Serial.println("");
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+    SerialBT.register_callback(callback_show_ip);
   }
-  else {
-    readFile(LittleFS, "/mydir/wifi.json");
-    ssid = credentials_array[0];
-    pass = credentials_array[1];
-    wifiInit(timeout, trial);
-  }
+
+  SerialBT.begin(bluetooth_name);
 }
 
-void loop() {
+bool init_wifi()
+{
+  String temp_pref_ssid = preferences.getString("pref_ssid", "");
+  String temp_pref_pass = preferences.getString("pref_pass");
 
-  if (trial > 3) {
-    wifiScan();
-    wifiInit(timeout, trial);
-  } else {
-    if ((millis() - timestart > 2000) && (WiFi.status() != WL_CONNECTED)) {
-      SerialBT.println("Reconnecting to Wifi...");
-      WiFi.disconnect();
-      wifiInit(timeout, trial);
-      trial++;
-      WiFi.reconnect();
-      timestart = millis();
+  if(!temp_pref_ssid.length()) return false;
+
+  pref_ssid = temp_pref_ssid.c_str();
+  pref_pass = temp_pref_pass.c_str();
+
+  Serial.print("Connecting to:  ");
+  Serial.println(pref_ssid);
+
+  start_wifi_millis = millis();
+  WiFi.begin(pref_ssid, pref_pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - start_wifi_millis > wifi_timeout) {
+      WiFi.disconnect(true, true);
+      return false;
     }
   }
+  return true;
 }
 
-void wifiScan() {
-
-  n = WiFi.scanNetworks();
-  SerialBT.println("Scan started");
-
-  delay(500);
-
-
-  if (n == 0) {
-    SerialBT.println("Not networks found");
-  } else {
-    for (int i = 0; i < n; i++) {
-      SerialBT.print(i + 1);
-      SerialBT.print(": ");
-      SerialBT.print(WiFi.SSID(i));
-      SerialBT.print(" (");
-      SerialBT.print(WiFi.RSSI(i));
-      SerialBT.print(")");
-      SerialBT.println("");
-    }
-    SerialBT.print("Enter the no. of the network you want to connect");
-    while (SerialBT.available() == 0) {}
-    no_ssid = SerialBT.parseInt();
-    wifiConnection();
-  }
-}
-
-void wifiInit(unsigned long &timeout, int &trial) {
+void scan_wifi_networks()
+{
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WiFi.SSID(no_ssid - 1), pass);
-
-  SerialBT.print("Connecting to Wifi...");
-  timeout = millis();
-  while ((WiFi.status() != WL_CONNECTED) && (millis() - timeout < 8000)) {
-    SerialBT.print(".");
-    delay(1000);
-  }
-
-  SerialBT.println("");
-
-  if (WiFi.status() != WL_CONNECTED && WiFi.status() != WL_NO_SSID_AVAIL) {
-    SerialBT.println("Password is not correct");
-    wifiConnection();
-  } else if (WiFi.status() != WL_CONNECTED && WiFi.status() == WL_NO_SSID_AVAIL) {
-    SerialBT.println("Wifi network is not avaliable");
+  // WiFi.scanNetworks will return the number of networks found
+  int n =  WiFi.scanNetworks();
+  if (n == 0) {
+    SerialBT.println("no networks found");
+    SerialBT.flush();
   } else {
-    SerialBT.print("");
-    SerialBT.print("Connected successfully");
-    SerialBT.print("IP Address : ");
-    SerialBT.print(WiFi.localIP());
-    createDir(LittleFS, "/mydir");  // Create a mydir folder
-    Config["ssid"] = WiFi.SSID(no_ssid - 1);
-    Config["pass"] = pass;
-    String output = "";
-    serializeJson(Config, output);
-    writeFile(LittleFS, "/mydir/wifi.txt", output);
-    trial = 0;
+    //SerialBT.println();
+    SerialBT.print(n);
+    SerialBT.println(" networks found");
+    SerialBT.flush();
+    delay(1000);
+    for (int i = 0; i < n; ++i) {
+      ssids_array[i + 1] = WiFi.SSID(i);
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.println(WiFi.SSID(i));
+      
+      network_string = i + 1;
+      network_string = network_string + ": " + WiFi.SSID(i) + " (Strength:" + WiFi.RSSI(i) + ")";
+      SerialBT.println(network_string);
+      SerialBT.flush();
+    }
+    wifi_stage = SCAN_COMPLETE;
   }
 }
 
-void wifiConnection() {
-  ssid = WiFi.SSID(no_ssid - 1);
-  pass.trim();
-
-  if ((WiFi.encryptionType(no_ssid - 1)) != WIFI_AUTH_OPEN) {
-    SerialBT.println("Please enter the password of the network you chose");
-    while (!SerialBT.available()) {}
-    SerialBT.setTimeout(5000);
-    pass = SerialBT.readString();
-    pass.trim();
-  } 
-  else 
-  {
-    pass = "";
+void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+  
+  if (event == ESP_SPP_SRV_OPEN_EVT) {
+    wifi_stage = SCAN_START;
   }
+
+  if (event == ESP_SPP_DATA_IND_EVT && wifi_stage == SCAN_COMPLETE) { // data from phone is SSID
+    int client_wifi_ssid_id = SerialBT.readString().toInt();
+    client_wifi_ssid = WiFi.SSID(client_wifi_ssid_id - 1);
+    wifi_stage = SSID_ENTERED;
+  }
+
+  if (event == ESP_SPP_DATA_IND_EVT && wifi_stage == WAIT_PASS) { // data from phone is password
+    client_wifi_password = SerialBT.readString();
+    client_wifi_password.trim();
+    wifi_stage = PASS_ENTERED;
+  }
+
+}
+
+void callback_show_ip(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+  if (event == ESP_SPP_SRV_OPEN_EVT) {
+    SerialBT.print("ESP32 IP: ");
+    SerialBT.println(WiFi.localIP());
+    SerialBT.flush();
+    bluetooth_disconnect = true;
+  }
+}
+
+void disconnect_bluetooth()
+{
+  delay(1000);
+  Serial.println("BT stopping");
+  SerialBT.println("Bluetooth disconnecting...");
+  delay(1000);
+  SerialBT.flush();
+  SerialBT.disconnect();
+  SerialBT.end();
+  Serial.println("BT stopped");
+  delay(1000);
+  bluetooth_disconnect = false;
+}
+
+void loop()
+{
+  
+  if (bluetooth_disconnect)
+  {
+    disconnect_bluetooth();
+  }
+
+  switch (wifi_stage)
+  {
+    case SCAN_START:
+      SerialBT.println("Scanning Wi-Fi networks");
+      SerialBT.flush();
+      Serial.println("Scanning Wi-Fi networks");
+      scan_wifi_networks();
+      SerialBT.println("Please enter the number for your Wi-Fi");
+      SerialBT.flush();
+      wifi_stage = SCAN_COMPLETE;
+      break;
+
+    case SSID_ENTERED:
+      SerialBT.println("Please enter your Wi-Fi password");
+      SerialBT.flush();
+      Serial.println("Please enter your Wi-Fi password");
+      wifi_stage = WAIT_PASS;
+      break;
+
+    case PASS_ENTERED:
+      SerialBT.println("Please wait for Wi-Fi connection...");
+      SerialBT.flush();
+      Serial.println("Please wait for Wi_Fi connection...");
+      wifi_stage = WAIT_CONNECT;
+      preferences.putString("pref_ssid", client_wifi_ssid);
+      preferences.putString("pref_pass", client_wifi_password);
+      if (init_wifi()) { // Connected to WiFi
+        connected_string = "ESP32 IP: ";
+        connected_string = connected_string + WiFi.localIP().toString();
+        SerialBT.println(connected_string);
+        Serial.println("\n" + connected_string);
+        bluetooth_disconnect = true;
+      } else { // try again
+        wifi_stage = LOGIN_FAILED;
+      }
+      WiFi.scanDelete();
+      break;
+
+    case LOGIN_FAILED:
+      SerialBT.println("Wi-Fi connection failed");
+      Serial.println("Wi-Fi connection failed");
+      delay(2000);
+      wifi_stage = SCAN_START;
+      break;
+  }
+  
+  if(digitalRead(FORMAT)==LOW){
+    Serial.println("Resetting configuration");
+    preferences.clear();
+    ESP.restart();
+  } 
 }
